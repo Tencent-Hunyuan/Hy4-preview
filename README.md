@@ -179,31 +179,44 @@ vllm serve tencent/Hy4-preview-FP8 \
   --served-model-name hy4-preview
 ```
 
-### SGLang
+Or use official prebuilt image `vllm/vllm-openai:hy4-preview`:
 
-Build SGLang from source:
 ```bash
-git clone https://github.com/sgl-project/sglang
-cd sglang
-pip3 install pip --upgrade
-pip3 install "transformers>=5.6.0"
-pip3 install -e "python"
+docker run --gpus all \
+  -p 8000:8000 \
+  --ipc=host \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  vllm/vllm-openai:hy4-preview tencent/Hy4-preview-FP8 \
+    --tensor-parallel-size 8 \
+    --speculative-config '{"num_speculative_tokens":3,"method":"mtp"}' \
+    --attention-backend FLASHMLA_SPARSE \
+    --tool-call-parser hy_v4 \
+    --reasoning-parser hy_v4 \
+    --enable-auto-tool-choice \
+    --port 8000 \
+    --served-model-name hy4-preview
 ```
 
-Launch SGLang server with MTP enabled:
+
+### SGLang
+
+Use the official prebuilt image `lmsysorg/sglang:hy4-preview` (multi-arch, x86 and Arm):
 
 ```bash
-python3 -m sglang.launch_server \
-  --model tencent/Hy4-preview-FP8 \
-  --tp-size 8 \
-  --tool-call-parser hy_v4 \
-  --reasoning-parser hy_v4 \
-  --speculative-num-steps 2 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 3 \
-  --speculative-algorithm EAGLE \
-  --port 8000 \
-  --served-model-name hy4-preview
+docker pull lmsysorg/sglang:hy4-preview
+
+docker run --gpus all --ipc=host -p 8000:8000 lmsysorg/sglang:hy4-preview \
+  python3 -m sglang.launch_server \
+    --model tencent/Hy4-preview-FP8 \
+    --tp-size 8 \
+    --reasoning-parser auto \
+    --tool-call-parser auto \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --port 8000 \
+    --served-model-name hy4-preview
 ```
 
 ## Finetuning
