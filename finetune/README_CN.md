@@ -143,8 +143,8 @@ Are you sure you want to continue connecting (yes/no)?
 - `--max_steps`: 训练的总步数
 - `--save_steps`: 每多少个 step 存储一个 checkpoint
 - `--use_lora`: 是否用 lora 训练，同时接收`--lora_rank`，`--lora_alpha`和`--lora_dropout`参数。lora 默认应用于 MLA（Multi-head Latent Attention）投影层："q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"，如果需要改变的话在代码中修改即可。注意：**使用 lora 训练时，只会保存 lora 的权重，而不会保存 base 模型的权重**
-- `--make_moe_param_leaf_module`：当用 zero3 以及 MoE 训练时，将 MoE 模块视作一个 leaf module，即它的参数不进行 zero3 切分，这个选项预计会显著增加显存占用
-- `--gradient_checkpointing`：开启梯度检查点- `--learning_rate`: 训练时的最大学习率
+- `--gradient_checkpointing`：开启梯度检查点
+- `--learning_rate`: 训练时的最大学习率
 - `--min_lr`: 训练时的最小学习率
 - `--use_flash_attn`: 开启 flash-attention 进行训练加速
 
