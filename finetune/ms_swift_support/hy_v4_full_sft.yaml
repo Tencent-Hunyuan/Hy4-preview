@@ -1,0 +1,63 @@
+
+# ---- Model Settings ----
+model: /path/to/hy_ckpt
+model_type: hy_v4
+template: hy_v4
+torch_dtype: bfloat16
+attn_impl: sdpa
+trust_remote_code: true
+
+# ---- Training Method ----
+train_type: full
+
+# ---- Dataset Settings ----
+dataset:
+  - ../data/example_data.jsonl
+max_length: 256
+lazy_tokenize: true
+dataset_num_proc: 4
+
+# ---- Output Settings ----
+output_dir: saves/hy_v4/full/sft_ds
+save_steps: 500
+save_strategy: steps
+save_total_limit: 3
+save_only_model: false
+logging_steps: 1
+report_to: none
+
+# ---- Training Hyperparameters ----
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+learning_rate: 1.0e-5
+num_train_epochs: 3.0
+warmup_steps: 0
+lr_scheduler_type: cosine_with_min_lr
+lr_scheduler_kwargs:
+  min_lr_rate: 0.1
+bf16: true
+
+# ---- DeepSpeed ZeRO-3 + CPU Offload ----
+# Use custom ds_config for fine-grained control over offload settings
+deepspeed: ../deepspeed_support/ds_zero3_offload.json
+
+# ---- Optimization ----
+# adamw_torch is required: adafactor's tuple eps is incompatible with
+# DeepSpeed's CPU Adam kernel (causes TypeError: adam_update())
+optim: adamw_torch
+gradient_checkpointing: true
+# use_reentrant=true is required for DeepSpeed ZeRO-3 to avoid
+# CheckpointError due to parameter partition state changes during recompute
+gradient_checkpointing_kwargs:
+  use_reentrant: true
+# max_grad_norm=0 skips grad norm computation (patched in hy_v4_swift_patches.py)
+# to avoid NCCL ALLREDUCE timeout on 770B model
+max_grad_norm: 0.0
+
+# ---- Distributed Training ----
+ddp_timeout: 180000000
+
+# ---- Misc ----
+seed: 42
+ignore_data_skip: true
+resume_from_checkpoint: null

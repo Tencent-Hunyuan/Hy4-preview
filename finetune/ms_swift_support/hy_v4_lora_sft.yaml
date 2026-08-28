@@ -1,0 +1,65 @@
+
+# ---- Model Settings ----
+model: /path/to/hy_ckpt
+model_type: hy_v4
+template: hy_v4
+torch_dtype: bfloat16
+attn_impl: sdpa
+trust_remote_code: true
+
+# ---- Training Method: LoRA ----
+train_type: lora
+lora_rank: 64
+lora_alpha: 128
+lora_dropout: 0.05
+# HYV4 uses MLA (Multi-head Latent Attention) with these projection names
+target_modules:
+  - q_a_proj
+  - q_b_proj
+  - kv_a_proj_with_mqa
+  - kv_b_proj
+  - o_proj
+
+# ---- Dataset Settings ----
+dataset:
+  - ../data/example_data.jsonl
+max_length: 1024
+lazy_tokenize: true
+dataset_num_proc: 4
+
+# ---- Output Settings ----
+output_dir: saves/hy_v4/lora/sft_fsdp
+save_steps: 500
+save_strategy: steps
+save_total_limit: 3
+save_only_model: false
+logging_steps: 1
+report_to: none
+
+# ---- Training Hyperparameters ----
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+learning_rate: 2.0e-4
+num_train_epochs: 3.0
+warmup_steps: 0
+lr_scheduler_type: cosine_with_min_lr
+lr_scheduler_kwargs:
+  min_lr_rate: 0.1
+bf16: true
+
+# ---- FSDP Configuration ----
+# ms-swift uses FSDP (PyTorch native). Pass the JSON config file path to --fsdp.
+# FSDP uses activation_checkpointing (configured in JSON) instead of gradient_checkpointing.
+fsdp: fsdp_hy_v4.json
+
+# ---- Optimization ----
+optim: adamw_torch
+max_grad_norm: 1.0
+
+# ---- Distributed Training ----
+ddp_timeout: 180000000
+
+# ---- Misc ----
+seed: 42
+ignore_data_skip: true
+resume_from_checkpoint: null
