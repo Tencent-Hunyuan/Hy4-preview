@@ -143,7 +143,6 @@ The key parameters in the script are as follows:
 - `--max_steps`: Total number of training steps.
 - `--save_steps`: Number of steps between saving checkpoints.
 - `--use_lora`: Whether to use LoRA training. Also accepts `--lora_rank`, `--lora_alpha`, and `--lora_dropout` parameters. By default, LoRA is applied to "q_proj", "k_proj", "v_proj", and "o_proj". To change this, modify the code. Note: **When using LoRA training, only the LoRA weights are saved, not the base model weights.**
-- `--make_moe_param_leaf_module`: When using ZeRO-3 with MoE training, treat the MoE module as a leaf module, i.e., its parameters are not partitioned by ZeRO-3. This option is expected to significantly increase memory usage.
 - `--gradient_checkpointing`: Enable gradient checkpointing.
 - `--learning_rate`: Maximum learning rate during training.
 - `--min_lr`: Minimum learning rate during training.
