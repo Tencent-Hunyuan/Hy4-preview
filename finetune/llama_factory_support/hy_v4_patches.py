@@ -50,6 +50,136 @@ _EXPERT_KEY_RE = re.compile(
     r"^(.*\.mlp\.experts\.)(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
 )
 
+_EXPERT_PROJS = ("gate_proj", "up_proj", "down_proj")
+
+
+def _derive_expected_expert_groups(weight_map):
+    """Derive the exact per-expert structure a checkpoint promises to contain.
+
+    Returns {prefix -> {expert_idx -> set(proj_names)}} for every inner-format
+    (per-expert) key in the safetensors index weight_map. Empty dict when the
+    checkpoint is in outer (pre-fused) format.
+    """
+    expected = {}
+    for key in weight_map:
+        m = _EXPERT_KEY_RE.match(key)
+        if m:
+            prefix, idx, proj = m.group(1), int(m.group(2)), m.group(3)
+            expected.setdefault(prefix, {}).setdefault(idx, set()).add(proj)
+    return expected
+
+
+def _validate_expert_group(prefix, experts, expected_ids=None):
+    """Validate a collected expert group before fusion; fail closed on gaps.
+
+    experts: {expert_idx -> {proj_name -> tensor}}
+    expected_ids: exact expert ids the checkpoint must provide. When None
+        (no index available), falls back to requiring the contiguous range
+        0..max(observed); a truncated trailing range is then caught later by
+        the ZeRO-3 loader's shape check (see _check_zero3_load_result).
+
+    Returns the sorted list of expert ids to fuse, in exact id order.
+    """
+    if expected_ids is None:
+        expected_ids = range(max(experts.keys()) + 1)
+    expected_ids = sorted(expected_ids)
+    missing = [i for i in expected_ids if i not in experts]
+    proj_missing = {
+        i: [p for p in _EXPERT_PROJS if p not in experts[i]]
+        for i in expected_ids
+        if i in experts and set(experts[i]) != set(_EXPERT_PROJS)
+    }
+    extra = sorted(set(experts) - set(expected_ids))
+    if missing or proj_missing or extra:
+        lines = [
+            "%s: refusing to fuse incomplete expert group" % prefix.rstrip("."),
+            "  expected experts: %d" % len(expected_ids),
+        ]
+        if missing:
+            lines.append("  missing experts: %s" % missing)
+        for i in sorted(proj_missing):
+            lines.append(
+                "  expert %d missing projections: %s" % (i, proj_missing[i])
+            )
+        if extra:
+            lines.append("  unexpected expert ids: %s" % extra)
+        raise RuntimeError("\n".join(lines))
+    return expected_ids
+
+
+def _fuse_expert_group(prefix, experts, expected_ids=None):
+    """Fuse validated per-expert tensors into (gate_up_proj, down_proj).
+
+    Expert id order is preserved exactly: row i of each fused tensor is
+    expert expected_ids[i]. Raises instead of skipping missing experts or
+    projections -- silently dropping either shifts every subsequent row and
+    desynchronizes gate_up_proj[i] from down_proj[i].
+    """
+    ids = _validate_expert_group(prefix, experts, expected_ids)
+    gate_up = torch.stack(
+        [
+            torch.cat([experts[i]["gate_proj"], experts[i]["up_proj"]], dim=0)
+            for i in ids
+        ],
+        dim=0,
+    )
+    down = torch.stack([experts[i]["down_proj"] for i in ids], dim=0)
+    return gate_up, down
+
+
+def _check_zero3_load_result(result, context):
+    """Fail closed on errors reported by _load_state_dict_into_zero3_model.
+
+    transformers >= 5.x returns (error_msgs, missing_keys); error_msgs holds
+    e.g. size-mismatch messages from module._load_from_state_dict.
+    missing_keys is ignored here: when loading shard-by-shard every call
+    legitimately misses most model keys.
+
+    The error channel is RANK-LOCAL: only the rank that performs the copy
+    inside GatheredParameters (modifier rank 0) observes error_msgs; every
+    other rank gets an empty list back for the same failed load. A compact
+    error count is therefore all-reduced across the process group so that
+    every rank aborts together -- otherwise the surviving ranks proceed into
+    the next collective and block on the dead rank. For loader failures
+    reported through error_msgs, every rank reaches this check once after
+    each _load_zero3 call in the same deterministic shard order, allowing
+    the failure to be propagated consistently. No collective is issued when
+    torch.distributed is not initialized (or world size is 1).
+    """
+    error_msgs = None
+    if isinstance(result, tuple) and len(result) >= 1 and isinstance(result[0], list):
+        error_msgs = result[0]
+    elif isinstance(result, list):
+        error_msgs = result
+    n_local = len(error_msgs) if error_msgs else 0
+
+    n_total = n_local
+    dist = torch.distributed
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        backend = str(dist.get_backend())
+        if "nccl" in backend and torch.cuda.is_available():
+            device = torch.device(
+                "cuda", int(os.environ.get("LOCAL_RANK", torch.cuda.current_device()))
+            )
+        else:
+            device = torch.device("cpu")
+        flag = torch.tensor([n_local], dtype=torch.long, device=device)
+        dist.all_reduce(flag, op=dist.ReduceOp.SUM)
+        n_total = int(flag.item())
+
+    if n_total:
+        if error_msgs:
+            raise RuntimeError(
+                "[HYV4] ZeRO-3 loader reported errors while loading %s:\n\t%s"
+                % (context, "\n\t".join(str(m) for m in error_msgs))
+            )
+        raise RuntimeError(
+            "[HYV4] ZeRO-3 loader reported %d error(s) on another rank while "
+            "loading %s (load errors are only observable on the rank that "
+            "performs the copy, normally rank 0 -- see its log for details); "
+            "aborting on all ranks." % (n_total, context)
+        )
+
 
 def _apply_buffer_loading_patch():
     """Patch the DeepSpeed ZeRO-3 state_dict loader to handle:
@@ -98,30 +228,16 @@ def _apply_buffer_loading_patch():
                         new_k = new_k.replace(old_sub, new_sub)
                 new_sd[new_k] = v
 
-        # Step 2: Fuse expert groups into 3D tensors
+        # Step 2: Fuse expert groups into 3D tensors.
+        # This path receives the full merged state_dict, so every expert of a
+        # group must be present here. Fusion fails closed on missing experts
+        # or projections instead of skipping them: skipping shifts every
+        # subsequent expert row and desynchronizes gate_up_proj/down_proj.
         if expert_groups:
             for prefix in sorted(expert_groups.keys()):
-                experts = expert_groups[prefix]
-                num_experts = max(experts.keys()) + 1
-                gate_up_list = []
-                down_list = []
-                for i in range(num_experts):
-                    if i not in experts:
-                        logger.warning(
-                            "HYV4 Patch 1: Missing expert %d in %s", i, prefix
-                        )
-                        continue
-                    exp = experts[i]
-                    if "gate_proj" in exp and "up_proj" in exp:
-                        gate_up_list.append(
-                            torch.cat([exp["gate_proj"], exp["up_proj"]], dim=0)
-                        )
-                    if "down_proj" in exp:
-                        down_list.append(exp["down_proj"])
-                if gate_up_list:
-                    new_sd[f"{prefix}gate_up_proj"] = torch.stack(gate_up_list, dim=0)
-                if down_list:
-                    new_sd[f"{prefix}down_proj"] = torch.stack(down_list, dim=0)
+                gate_up, down = _fuse_expert_group(prefix, expert_groups[prefix])
+                new_sd[f"{prefix}gate_up_proj"] = gate_up
+                new_sd[f"{prefix}down_proj"] = down
             logger.info(
                 "HYV4 Patch 1: Fused %d expert groups from per-expert to 3D format.",
                 len(expert_groups)
@@ -465,8 +581,43 @@ def _apply_shard_loading_patch():
             with open(index_file, "r") as f:
                 index_data = _json.load(f)
             shard_files = list(dict.fromkeys(index_data["weight_map"].values()))
+            # Loading-time source of truth for per-expert (inner format)
+            # checkpoints: the exact expert ids/projections promised by the
+            # index. Completeness of an expert group is decided against this,
+            # never inferred from "ids seen so far form a contiguous range",
+            # which can mistake a complete contiguous prefix for the full
+            # group when that group spans shards. Empty for outer-format
+            # checkpoints such as the official Hy4 release.
+            expected_expert_groups = _derive_expected_expert_groups(
+                index_data["weight_map"]
+            )
         else:
             shard_files = ["model.safetensors"]
+            expected_expert_groups = {}
+
+        # Cross-validate the index-derived expert structure against the model
+        # config before touching any tensor data.
+        if expected_expert_groups:
+            cfg_num_experts = getattr(config, "n_routed_experts", None)
+            if cfg_num_experts is None:
+                cfg_num_experts = getattr(config, "num_experts", None)
+            for prefix in sorted(expected_expert_groups.keys()):
+                ids = sorted(expected_expert_groups[prefix])
+                problems = []
+                if ids != list(range(len(ids))):
+                    problems.append(
+                        "non-contiguous expert ids in checkpoint index"
+                    )
+                if cfg_num_experts is not None and len(ids) != cfg_num_experts:
+                    problems.append(
+                        "checkpoint index provides %d experts but model "
+                        "config expects %d" % (len(ids), cfg_num_experts)
+                    )
+                if problems:
+                    raise RuntimeError(
+                        "[HYV4 Patch 3] Invalid expert structure for %s: %s"
+                        % (prefix.rstrip("."), "; ".join(problems))
+                    )
 
         # Step 3: Load each shard and scatter into ZeRO-3 model
         total_shards = len(shard_files)
@@ -519,33 +670,42 @@ def _apply_shard_loading_patch():
                     pending_experts[prefix][idx].update(projs)
             del expert_keys_in_shard
 
-            # Check for completed expert groups
+            # Check for completed expert groups. With an index, a group is
+            # complete exactly when every expert id/projection the index
+            # promises has been seen -- this also releases a group (and its
+            # CPU memory) at the earliest safe shard. Without an index the
+            # whole checkpoint is a single file, so all keys arrive at once
+            # and the contiguity heuristic below cannot fire early.
             completed_prefixes = []
             for prefix, experts in pending_experts.items():
                 if not experts:
                     continue
-                max_idx = max(experts.keys())
-                num_experts_found = len(experts)
-                all_complete = all(
-                    len(projs) == 3 for projs in experts.values()
-                )
-                if all_complete and num_experts_found == (max_idx + 1):
-                    completed_prefixes.append(prefix)
+                expected = expected_expert_groups.get(prefix)
+                if expected is not None:
+                    if experts.keys() == expected.keys() and all(
+                        set(experts[i]) >= expected[i] for i in expected
+                    ):
+                        completed_prefixes.append(prefix)
+                else:
+                    max_idx = max(experts.keys())
+                    all_complete = all(
+                        set(projs) == set(_EXPERT_PROJS)
+                        for projs in experts.values()
+                    )
+                    if all_complete and len(experts) == (max_idx + 1):
+                        completed_prefixes.append(prefix)
 
-            # Fuse completed expert groups
+            # Fuse completed expert groups (fails closed on any gap and
+            # preserves exact expert id -> row correspondence).
             for prefix in completed_prefixes:
                 experts = pending_experts.pop(prefix)
-                num_experts_layer = max(experts.keys()) + 1
-                gate_up_list = []
-                down_list = []
-                for i in range(num_experts_layer):
-                    exp = experts[i]
-                    gate_up = torch.cat([exp["gate_proj"], exp["up_proj"]], dim=0)
-                    gate_up_list.append(gate_up)
-                    down_list.append(exp["down_proj"])
-                fused_gate_up = torch.stack(gate_up_list, dim=0)
-                fused_down = torch.stack(down_list, dim=0)
-                del gate_up_list, down_list, experts
+                expected = expected_expert_groups.get(prefix)
+                expected_ids = sorted(expected) if expected is not None else None
+                fused_gate_up, fused_down = _fuse_expert_group(
+                    prefix, experts, expected_ids
+                )
+                num_experts_layer = fused_gate_up.shape[0]
+                del experts
                 renamed_sd[f"{prefix}gate_up_proj"] = fused_gate_up
                 renamed_sd[f"{prefix}down_proj"] = fused_down
                 logger.info(
@@ -555,60 +715,65 @@ def _apply_shard_loading_patch():
 
             # Scatter this shard's weights into ZeRO-3 model
             if renamed_sd:
-                _load_zero3(model, renamed_sd)
+                load_result = _load_zero3(model, renamed_sd)
+                # _load_state_dict_into_zero3_model does NOT raise on load
+                # errors (e.g. size mismatches); it returns them as
+                # (error_msgs, missing_keys). Fail closed here -- discarding
+                # error_msgs leaves parameters silently uninitialized while
+                # the load is reported as successful.
+                _check_zero3_load_result(load_result, "shard %s" % shard_name)
                 # Also load buffers
                 for name, buf in model.named_buffers():
                     if name in renamed_sd:
                         src_tensor = renamed_sd[name]
                         if isinstance(src_tensor, torch.Tensor):
                             buf.data.copy_(src_tensor.to(buf.dtype))
+                # Only mark keys as loaded after the load actually succeeded.
                 all_loaded_keys.update(renamed_sd.keys())
             del renamed_sd
             gc.collect()
 
-        # Flush remaining pending experts
+        # Any expert group still pending after the last shard was never
+        # completed by the checkpoint. Fail closed with exact diagnostics
+        # instead of fusing a partial tensor: skipping missing experts shifts
+        # every subsequent expert row, silently reassigning expert identities.
         if pending_experts:
-            logger.info(
-                "[HYV4 Patch 3] Flushing %d remaining expert group(s)...",
-                len(pending_experts)
-            )
-            flush_sd = {}
-            for prefix, experts in pending_experts.items():
-                num_experts_layer = max(experts.keys()) + 1
-                gate_up_list = []
-                down_list = []
-                for i in range(num_experts_layer):
-                    if i not in experts:
-                        logger.warning(
-                            "[HYV4 Patch 3] Missing expert %d in %s", i, prefix
-                        )
-                        continue
-                    exp = experts[i]
-                    gate_up = torch.cat([exp["gate_proj"], exp["up_proj"]], dim=0)
-                    gate_up_list.append(gate_up)
-                    down_list.append(exp["down_proj"])
-                if gate_up_list:
-                    fused_gate_up = torch.stack(gate_up_list, dim=0)
-                    fused_down = torch.stack(down_list, dim=0)
-                    flush_sd[f"{prefix}gate_up_proj"] = fused_gate_up
-                    flush_sd[f"{prefix}down_proj"] = fused_down
-                    logger.info(
-                        "[HYV4 Patch 3]   Fused %d experts for %s",
-                        len(gate_up_list), prefix
-                    )
-                del gate_up_list, down_list
-            del pending_experts
-
-            if flush_sd:
-                _load_zero3(model, flush_sd)
-                for name, buf in model.named_buffers():
-                    if name in flush_sd:
-                        src_tensor = flush_sd[name]
-                        if isinstance(src_tensor, torch.Tensor):
-                            buf.data.copy_(src_tensor.to(buf.dtype))
+            failures = []
+            for prefix in sorted(pending_experts.keys()):
+                experts = pending_experts[prefix]
+                expected = expected_expert_groups.get(prefix)
+                expected_ids = sorted(expected) if expected is not None else None
+                try:
+                    _validate_expert_group(prefix, experts, expected_ids)
+                except RuntimeError as e:
+                    failures.append(str(e))
+                    continue
+                # Defensive: a group the per-shard completion check missed
+                # but that validates as complete -- fuse and load it.
+                fused_gate_up, fused_down = _fuse_expert_group(
+                    prefix, experts, expected_ids
+                )
+                flush_sd = {
+                    f"{prefix}gate_up_proj": fused_gate_up,
+                    f"{prefix}down_proj": fused_down,
+                }
+                load_result = _load_zero3(model, flush_sd)
+                _check_zero3_load_result(
+                    load_result, "expert group %s" % prefix.rstrip(".")
+                )
                 all_loaded_keys.update(flush_sd.keys())
-            del flush_sd
+                logger.info(
+                    "[HYV4 Patch 3]   Fused %d experts for %s at EOF",
+                    fused_gate_up.shape[0], prefix
+                )
+                del flush_sd
+            del pending_experts
             gc.collect()
+            if failures:
+                raise RuntimeError(
+                    "[HYV4 Patch 3] Incomplete expert group(s) at end of "
+                    "checkpoint:\n" + "\n".join(failures)
+                )
 
         # Report missing/unexpected keys
         model_keys = set(n for n, _ in model.named_parameters())
