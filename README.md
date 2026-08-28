@@ -151,7 +151,9 @@ See the [Deployment](#deployment) section below for how to start the API server.
 
 ## Deployment
 
-For production serving, we recommend using [vLLM](https://github.com/vllm-project/vllm) or [SGLang](https://docs.sglang.io/).
+For production serving, we recommend using [vLLM](https://github.com/vllm-project/vllm) or [SGLang](https://docs.sglang.io/). Please refer to the recipes:
+- [Hy4-Preview vLLM Recipe](https://recipes.vllm.ai/tencent/Hy4-preview)
+- [Hy4-Preview SGLang Cookbook](https://lmsysorg.mintlify.app/cookbook/autoregressive/Tencent/Hy4-Preview)
 
 ### vLLM
 

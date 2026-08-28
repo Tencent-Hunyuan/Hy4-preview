@@ -151,7 +151,10 @@ print(response.choices[0].message.content)
 
 ## 推理和部署
 
-对于生产环境部署，我们建议使用 [vLLM](https://github.com/vllm-project/vllm) 或 [SGLang](https://docs.sglang.io/)。
+对于生产环境部署，我们建议使用 [vLLM](https://github.com/vllm-project/vllm) 或 [SGLang](https://docs.sglang.io/)。请参考部署方案：
+- [Hy4-Preview vLLM Recipe](https://recipes.vllm.ai/tencent/Hy4-preview)
+- [Hy4-Preview SGLang Cookbook](https://lmsysorg.mintlify.app/cookbook/autoregressive/Tencent/Hy4-Preview)
+
 
 ### vLLM
 
