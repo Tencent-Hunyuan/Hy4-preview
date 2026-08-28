@@ -157,31 +157,7 @@ For production serving, we recommend using [vLLM](https://github.com/vllm-projec
 
 ### vLLM
 
-Build vLLM from source:
-```bash
-uv venv --python 3.12 --seed --managed-python
-source .venv/bin/activate
-git clone https://github.com/vllm-project/vllm.git
-cd vllm
-uv pip install --editable . --torch-backend=auto
-```
-
-Start the vLLM server with MTP enabled:
-
-```bash
-vllm serve tencent/Hy4-preview-FP8 \
-  --tensor-parallel-size 8 \
-  --speculative-config.method mtp \
-  --speculative-config.num_speculative_tokens 3 \
-  --attention-backend FLASHMLA_SPARSE \
-  --tool-call-parser hy_v4 \
-  --reasoning-parser hy_v4 \
-  --enable-auto-tool-choice \
-  --port 8000 \
-  --served-model-name hy4-preview
-```
-
-Or use official prebuilt image `vllm/vllm-openai:hy4-preview`:
+Use official prebuilt image `vllm/vllm-openai:hy4-preview`:
 
 ```bash
 docker run --gpus all \

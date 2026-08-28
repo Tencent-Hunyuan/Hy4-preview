@@ -158,33 +158,7 @@ print(response.choices[0].message.content)
 
 ### vLLM
 
-从源码构建 vLLM：
-
-```bash
-uv venv --python 3.12 --seed --managed-python
-source .venv/bin/activate
-git clone https://github.com/vllm-project/vllm.git
-cd vllm
-uv pip install --editable . --torch-backend=auto
-```
-
-启动 vLLM 服务，开启 MTP：
-
-```bash
-vllm serve tencent/Hy4-preview-FP8 \
-  --tensor-parallel-size 8 \
-  --speculative-config.method mtp \
-  --speculative-config.num_speculative_tokens 3 \
-  --attention-backend FLASHMLA_SPARSE \
-  --tool-call-parser hy_v4 \
-  --reasoning-parser hy_v4 \
-  --enable-auto-tool-choice \
-  --port 8000 \
-  --served-model-name hy4-preview
-```
-
-
-或者使用社区官方镜像部署：`vllm/vllm-openai:hy4-preview`：
+使用社区官方镜像部署：`vllm/vllm-openai:hy4-preview`：
 
 ```bash
 docker run --gpus all \
